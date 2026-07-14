@@ -4,6 +4,26 @@ Open Occupation Blueprint for **ISCO-08 3334**: Real Estate Agents and Property 
 
 This repository designs a forkable OSS business for an independent real estate and property management practice: a property-condition documentation robot manages listing and tenancy records under a governor-gated actor, so the practice keeps its own property records instead of renting a closed real-estate SaaS.
 
+**Maturity: `:implemented`.** `src/realestate/` implements the
+`RealEstateActor` as a `langgraph.graph/state-graph` (`realestate.actor`)
+wired to a `Real Estate Advisor` (`realestate.advisor`) and an
+independent `RealEstateGovernor` (`realestate.governor`), following the
+itonami actor pattern (ADR-2607011000): `:intake -> :advise -> :govern ->
+:decide -+-> :commit (:ok?) +-> :request-approval (:escalate?,
+human-in-the-loop interrupt) +-> :hold (:hard?)`. 14 tests / 29 assertions
+green (`clojure -M:test`). HARD invariants (always hold, never
+overridable): client provenance, no-actuation (`:effect` must be
+`:propose`), a registered listing basis for any lease-execution
+proposal, the proposed execution amount not exceeding the listing's
+registered authorization ceiling (executing beyond it is unauthorized
+disposition, not diligent management), and completed tenant screening
+before any lease can be executed (offering a lease without one is an
+unscreened placement, not efficient service). Always-escalate ops
+(human sign-off regardless of confidence, mapping this repo's Trust
+Controls in [`docs/business-model.md`](docs/business-model.md)):
+`:approve-over-authorization-execution` and
+`:approve-security-deposit-disbursement`.
+
 ## Robotics premise
 
 All cloud-itonami verticals are designed on the premise that a **robot performs

@@ -1,0 +1,501 @@
+(ns realestate.observation-test
+  "Deterministic fixtures for listing-observation/1 — temporal refresh,
+  entity separation, currency/area basis, provenance, missingness and
+  query/readback. No network, no model, no clock: every date is a fixed
+  fixture string."
+  (:require [clojure.test :refer [deftest is testing]]
+            [realestate.observation :as obs]))
+
+(defn- refusal-of
+  "The refusal code thrown by f, or nil when f returns normally."
+  [f]
+  (try (f) nil
+       (catch :default e (obs/refusal-code e))))
+
+(def base-receipt
+  {:receipt/source-url "https://practice.example/listings/L-1"
+   :receipt/source-class :brokerage-first-party
+   :receipt/source-language "ja"
+   :receipt/observed-at "2026-09-01"
+   :receipt/asserted-at "2026-08-30"
+   :receipt/content-hash "hash-listing-1"
+   :receipt/issuing-entity "Practice 3334"
+   :receipt/jurisdiction "JPN"
+   :receipt/method :verbatim-citation})
+
+(def base-subject {:subject/id "L-1" :subject/scope :first-party-listing})
+
+(def base-window {:from "2026-08-01" :to "2026-08-31"})
+(def price-figure
+  {:figure/kind :asking-price :figure/raw "売買価格 68,000,000円"
+   :figure/amount 68000000 :figure/currency "JPY"
+   :figure/nominal-at "2026-08-15"})
+
+(def area-figure
+  {:figure/kind :asking-area :figure/raw "専有面積 85.5平方メートル"
+   :figure/value 85.5 :figure/area-unit :m2})
+
+(defn- base-observation [over]
+  (merge {:obs/subject base-subject
+          :obs/window base-window
+          :obs/jurisdiction "JPN"
+          :obs/figures [price-figure]
+          :obs/missingness #{}
+          :obs/receipts #{base-receipt}
+          :obs/recorded-at "2026-09-01"}
+         over))
+
+(deftest freeze-receipt-stamps-method-and-derived-id
+  (let [r (obs/receipt base-receipt)]
+    (is (contains? r :receipt/id))
+    (is (string? (:receipt/id r)))
+    ;; same inputs -> same derived id (deterministic)
+    (is (= (:receipt/id r) (:receipt/id (obs/receipt base-receipt))))))
+
+(deftest derived-observation-id-is-stable-per-recorded-at
+  (let [h (obs/observe [] (base-observation {}))]
+    (is (= 1 (count h)))
+    (is (re-matches #"^obs:L-1:JPN:2026-08-01:2026-08-31:2026-09-01$"
+                    (:obs/id (first h))))
+    ;; same observation re-observed on a later recording day derives a NEW id
+    (let [h2 (obs/observe h (base-observation {:obs/recorded-at "2026-09-02"}))]
+      (is (= 2 (count h2)))
+      (is (not= (:obs/id (first h2)) (:obs/id (second h2)))))))
+
+(deftest refuse-unknown-subject-scope
+  (is (= :subject/unknown-scope
+         (refusal-of #(obs/observe []
+                                   (base-observation
+                                    {:obs/subject {:subject/id "L-1"
+                                                   :subject/scope :portal-scrape}}))))))
+
+(deftest refuse-personal-data-and-address-keys
+  (is (= :subject/address-refused
+         (refusal-of #(obs/subject {:subject/id "L-1"
+                                    :subject/scope :first-party-listing
+                                    :address "1-2-3 Roppongi, Minato-ku"}))))
+  (is (= :subject/address-refused
+         (refusal-of #(obs/subject {:subject/id "L-1"
+                                    :subject/scope :first-party-listing
+                                    :landlord-name "Taro"}))))
+  (is (= :observation/personal-data-refused
+         (refusal-of #(obs/observe []
+                                   (base-observation {:obs/street-address "x"})))))
+  (is (= :observation/personal-data-refused
+         (refusal-of #(obs/observe []
+                                   (base-observation
+                                    {:obs/events [{:event/type :listing-published
+                                                   :event/publication-ref "p1"
+                                                   :owner-name "Taro"}]}))))))
+
+(deftest refuse-cross-jurisdiction-receipt
+  (let [de (assoc base-receipt :receipt/jurisdiction "DEU"
+                  :receipt/source-url "https://practice.example/de/L-1")]
+    (is (= :receipt/cross-jurisdiction-receipt
+           (refusal-of #(obs/observe [] (base-observation {:obs/receipts #{de}})))))))
+
+(deftest refuse-forbidden-and-unknown-source-classes
+  (is (= :receipt/forbidden-source-class
+         (refusal-of #(obs/receipt (assoc base-receipt :receipt/source-class
+                                          :social-post)))))
+  (is (= :receipt/forbidden-source-class
+         (refusal-of #(obs/receipt (assoc base-receipt :receipt/source-class
+                                          :neighborhood-gossip))))))
+
+(deftest refuse-empty-receipts-and-bad-window-and-bad-recorded-at
+  (is (= :observation/no-receipts
+         (refusal-of #(obs/observe [] (base-observation {:obs/receipts #{}})))))
+  (is (= :observation/bad-window
+         (refusal-of #(obs/observe []
+                                   (base-observation
+                                    {:obs/window {:from "2026-08-31"
+                                                  :to "2026-08-01"}})))))
+  (is (= :observation/bad-recorded-at
+         (refusal-of #(obs/observe []
+                                   (base-observation {:obs/recorded-at "tomorrow"}))))))
+
+(deftest refuse-unknown-missingness-flag
+  (is (= :observation/unknown-missingness-flag
+         (refusal-of #(obs/observe []
+                                   (base-observation
+                                    {:obs/missingness #{:market-hot}}))))))
+
+(deftest silence-must-not-claim-completeness
+  (is (= :obs/silence-claims-completeness
+         (refusal-of #(obs/observe []
+                                   (base-observation {:obs/figures []})))))
+  ;; declaring the gap makes silence honest
+  (let [h (obs/observe []
+                      (base-observation {:obs/figures []
+                                         :obs/missingness #{:asking-price-unpublished}}))]
+    (is (= 1 (count h)))))
+
+(deftest asking-area-requires-a-named-area-unit
+  (is (= :figure/dimensional-without-area-unit
+         (refusal-of #(obs/figure (assoc area-figure :figure/area-unit nil)))))
+  (is (= :figure/dimensional-without-area-unit
+         (refusal-of #(obs/figure (assoc area-figure :figure/area-unit :ping)))))
+  (is (= :asking-area (:figure/kind (obs/figure area-figure)))))
+
+(deftest monetary-figures-carry-currency-and-nominal-at
+  (is (= :figure/bad-currency
+         (refusal-of #(obs/figure (assoc price-figure :figure/currency "jpy")))))
+  (is (= :figure/bad-currency
+         (refusal-of #(obs/figure (assoc price-figure :figure/currency "yen")))))
+  (is (= :figure/bad-nominal-at
+         (refusal-of #(obs/figure (assoc price-figure :figure/nominal-at "2026-08")))))
+  (is (= :figure/bad-amount
+         (refusal-of #(obs/figure (assoc price-figure :figure/amount -1))))))
+
+(deftest entity-separation-two-subjects-two-lineages
+  (let [h1 (obs/observe [] (base-observation {}))
+        h2 (obs/observe h1 (base-observation
+                            {:obs/subject {:subject/id "L-2"
+                                           :subject/scope :first-party-lease-listing}}))]
+    (is (= 2 (count h2)))
+    (is (= #{"L-1" "L-2"}
+           (set (map #(get-in % [:obs/subject :subject/id]) h2))))
+    ;; a refresh across subjects is refused
+    (is (= :observation/refresh-of-cross-subject
+           (refusal-of #(obs/refresh h2 (:obs/id (first h2))
+                                     (base-observation
+                                      {:obs/subject {:subject/id "L-9"
+                                                     :subject/scope :first-party-listing}})))))))
+
+(deftest history-refuses-duplicate-ids-and-rescoping
+  (let [h (obs/observe [] (base-observation {}))]
+    (is (= :history/duplicate-observation-id
+           (refusal-of #(obs/observe h (base-observation {})))))
+    (is (= :history/subject-scope-conflict
+           (refusal-of #(obs/observe
+                         h (base-observation
+                            {:obs/recorded-at "2026-09-03"
+                             :obs/subject {:subject/id "L-1"
+                                           :subject/scope :first-party-lease-listing}})))))))
+
+(deftest refresh-links-lineage-and-refuses-bad-links
+  (let [h1 (obs/observe [] (base-observation {}))
+        prior (:obs/id (first h1))
+        h2 (obs/refresh h1 prior (base-observation {:obs/recorded-at "2026-09-02"}))]
+    (is (= prior (:obs/refresh-of (second h2))))
+    (is (= :observation/refresh-of-unknown
+           (refusal-of #(obs/refresh h2 "obs:nope" (base-observation {})))))
+    (is (= :observation/refresh-of-self
+           (refusal-of #(obs/refresh h2 prior (base-observation {}))))))))
+
+(deftest refresh-delta-is-verbatim-level
+  (let [h1 (obs/observe [] (base-observation {}))
+        prior (first h1)
+        revised-price {:figure/kind :asking-price
+                       :figure/raw "売買価格 65,000,000円（改定）"
+                       :figure/amount 65000000 :figure/currency "JPY"
+                       :figure/nominal-at "2026-08-20"
+                       :figure/event-ref "pub-2"}
+        next-obs (obs/refresh h1 (:obs/id prior)
+                              (base-observation
+                               {:obs/recorded-at "2026-09-02"
+                                :obs/figures [revised-price area-figure]
+                                :obs/events [{:event/type :asking-price-revised
+                                              :event/publication-ref "pub-2"}]}))
+        next (second next-obs)
+        d (obs/refresh-delta prior next)]
+    (is (= :changed (:delta/kind d)))
+    ;; both sides carried IN FULL, side by side — no numeric difference
+    (is (= 68000000 (get-in d [:delta/removed-figures 0 :figure/amount])))
+    (is (= 65000000
+           (:figure/amount (first (filter #(= :asking-price (:figure/kind %))
+                                          (:delta/added-figures d))))))
+    (is (= "売買価格 65,000,000円（改定）"
+           (:figure/raw (first (filter #(= :asking-price (:figure/kind %))
+                                       (:delta/added-figures d))))))
+    (is (= 1 (count (:delta/added-events d))))
+    (is (= :asking-price-revised (:event/type (first (:delta/added-events d)))))
+    (is (string? (:delta/comparability-note d)))))
+
+(deftest refresh-delta-reports-re-attribution-verbatim-basis-unchanged
+  (let [r2 (assoc base-receipt
+                  :receipt/source-url "https://portal.example/practice/L-1"
+                  :receipt/observed-at "2026-09-02"
+                  :receipt/source-class :brokerage-first-party)
+        h1 (obs/observe [] (base-observation {}))
+        prior (first h1)
+        h2 (obs/refresh h1 (:obs/id prior)
+                        (base-observation {:obs/recorded-at "2026-09-02"
+                                           :obs/receipts #{r2}}))
+        next (second h2)
+        d (obs/refresh-delta prior next)]
+    ;; same verbatim basis, receipt moved -> reported re-attribution
+    (is (= 1 (count (:delta/re-attributed d))))
+    (is (= (:figure/source (first (:obs/figures prior)))
+           (:delta/prior-receipt (first (:delta/re-attributed d)))))
+    (is (not= (:delta/prior-receipt (first (:delta/re-attributed d)))
+              (:delta/next-receipt (first (:delta/re-attributed d)))))))
+
+(deftest refresh-delta-unchanged-when-only-receipts-and-day-move
+  (let [h1 (obs/observe [] (base-observation {}))
+        prior (first h1)
+        h2 (obs/refresh h1 (:obs/id prior)
+                        (base-observation {:obs/recorded-at "2026-09-02"}))
+        next (second h2)
+        d (obs/refresh-delta prior next)]
+    (is (= :unchanged (:delta/kind d)))
+    (is (empty? (:delta/added-figures d)))
+    (is (empty? (:delta/re-attributed d)))))
+
+(deftest readback-latest-at-or-before-and-refuses-tampering
+  (let [h1 (obs/observe [] (base-observation {}))
+        h2 (obs/refresh h1 (:obs/id (first h1))
+                        (base-observation {:obs/recorded-at "2026-09-02"}))
+        rb1 (obs/readback h2 "L-1" "2026-09-01")
+        rb2 (obs/readback h2 "L-1" "2026-09-02")]
+    (is (= "2026-09-01" (:obs/recorded-at rb1)))
+    (is (= "2026-09-02" (:obs/recorded-at rb2)))
+    (is (nil? (obs/readback h2 "L-1" "2026-08-31")))
+    (is (nil? (obs/readback h2 "L-404" "2026-09-02")))
+    (is (= :readback/bad-as-of
+           (refusal-of #(obs/readback h2 "L-1" "September"))))
+    ;; tampered figure refused on the way out
+    (let [tampered (assoc-in rb2 [:obs/figures 0 :figure/amount] nil)]
+      (is (= :figure/bad-amount
+             (refusal-of #(obs/revalidate-observation tampered)))))))
+
+(deftest readback-chain-oldest-first-with-pairwise-deltas
+  (let [h1 (obs/observe [] (base-observation {}))
+        h2 (obs/refresh h1 (:obs/id (first h1))
+                        (base-observation {:obs/recorded-at "2026-09-02"}))
+        h3 (obs/refresh h2 (:obs/id (second h2))
+                        (base-observation {:obs/recorded-at "2026-09-03"}))
+        c (obs/readback-chain h3 "L-1")]
+    (is (= 3 (count (:chain c))))
+    (is (= 2 (count (:deltas c))))
+    (is (= ["2026-09-01" "2026-09-02" "2026-09-03"]
+           (map :obs/recorded-at (:chain c))))
+    (is (every? #(= :unchanged (:delta/kind %)) (:deltas c)))
+    ;; broken lineage is refused
+    (let [h4 (conj (vec h3) (assoc (last h3)
+                                   :obs/id "obs:phantom"
+                                   :obs/refresh-of "obs:never-was"))]
+      (is (= :readback/broken-lineage
+             (refusal-of #(obs/readback-chain h4 "L-1")))))))
+
+(deftest published-change-events-are-frozen-and-derived
+  (let [ev (obs/event {:event/kind :asking-change-announced
+                       :event/subject base-subject
+                       :event/jurisdiction "JPN"
+                       :event/effective-at "2026-09-10"
+                       :event/announcement-raw
+                       "当社物件L-1の売買価格を65,000,000円に改定しました（9月10日付）。"
+                       :event/figures [{:figure/kind :asking-price
+                                        :figure/raw "65,000,000円（改定）"
+                                        :figure/amount 65000000
+                                        :figure/currency "JPY"
+                                        :figure/nominal-at "2026-09-10"}]
+                       :event/missingness #{}
+                       :event/receipts #{base-receipt}
+                       :event/recorded-at "2026-09-05"})]
+    (is (re-matches #"^evt:JPN:L-1:asking-change-announced:2026-09-10:2026-09-05$"
+                    (:event/id ev)))
+    (is (= 1 (count (:event/figures ev))))
+    ;; sole-receipt fallback attributed the figure
+    (is (= (:receipt/id (obs/receipt base-receipt))
+           (:figure/source (first (:event/figures ev)))))))
+
+(deftest events-refuse-missing-announcement-and-personal-data
+  (is (= :event/missing-field
+         (refusal-of #(obs/event {:event/kind :asking-change-announced
+                                  :event/subject base-subject
+                                  :event/jurisdiction "JPN"
+                                  :event/effective-at "2026-09-10"
+                                  :event/receipts #{base-receipt}
+                                  :event/recorded-at "2026-09-05"}))))
+  (is (= :event/empty-announcement
+         (refusal-of #(obs/event {:event/kind :asking-change-announced
+                                  :event/subject base-subject
+                                  :event/jurisdiction "JPN"
+                                  :event/effective-at "2026-09-10"
+                                  :event/announcement-raw "   "
+                                  :event/receipts #{base-receipt}
+                                  :event/recorded-at "2026-09-05"}))))
+  (is (= :event/personal-data-refused
+         (refusal-of #(obs/event {:event/kind :asking-change-announced
+                                  :event/subject base-subject
+                                  :event/jurisdiction "JPN"
+                                  :event/effective-at "2026-09-10"
+                                  :event/announcement-raw "announced"
+                                  :event/landlord "Taro"
+                                  :event/receipts #{base-receipt}
+                                  :event/recorded-at "2026-09-05"}))))
+  (is (= :event/unknown-kind
+         (refusal-of #(obs/event {:event/kind :price-crash-announced
+                                  :event/subject base-subject
+                                  :event/jurisdiction "JPN"
+                                  :event/effective-at "2026-09-10"
+                                  :event/announcement-raw "announced"
+                                  :event/receipts #{base-receipt}
+                                  :event/recorded-at "2026-09-05"})))))
+
+(deftest events-refresh-events-never-observations
+  (let [h (obs/record-event []
+                           (obs/event {:event/kind :asking-change-announced
+                                       :event/subject base-subject
+                                       :event/jurisdiction "JPN"
+                                       :event/effective-at "2026-09-10"
+                                       :event/announcement-raw "v1 announcement"
+                                       :event/receipts #{base-receipt}
+                                       :event/recorded-at "2026-09-05"}))
+        prior (:event/id (first h))
+        h2 (obs/refresh-event h prior
+                              (obs/event {:event/kind :asking-change-announced
+                                          :event/subject base-subject
+                                          :event/jurisdiction "JPN"
+                                          :event/effective-at "2026-09-10"
+                                          :event/announcement-raw "v2 announcement"
+                                          :event/receipts #{base-receipt}
+                                          :event/recorded-at "2026-09-08"}))]
+    (is (= 2 (count h2)))
+    (is (= prior (:event/refresh-of (second h2))))
+    (is (= :event/refresh-of-unknown
+           (refusal-of #(obs/refresh-event h2 "evt:nowhere"
+                                           (obs/event {:event/kind :status-change-announced
+                                                       :event/subject base-subject
+                                                       :event/jurisdiction "JPN"
+                                                       :event/effective-at "2026-09-11"
+                                                       :event/announcement-raw "x"
+                                                       :event/receipts #{base-receipt}
+                                                       :event/recorded-at "2026-09-09"})))))
+    ;; events never refresh observations: one artifact kind is not the other's parent
+    (let [h3 (obs/observe h2 (base-observation {}))]
+      (is (= :event/refresh-of-observation
+             (refusal-of #(obs/refresh-event h3 (:obs/id (last h3))
+                                             (obs/event {:event/kind :status-change-announced
+                                                         :event/subject base-subject
+                                                         :event/jurisdiction "JPN"
+                                                         :event/effective-at "2026-09-11"
+                                                         :event/announcement-raw "x"
+                                                         :event/receipts #{base-receipt}
+                                                         :event/recorded-at "2026-09-09"}))))))))
+
+(deftest event-delta-carries-both-sides-verbatim
+  (let [ev1 (obs/event {:event/kind :asking-change-announced
+                        :event/subject base-subject
+                        :event/jurisdiction "JPN"
+                        :event/effective-at "2026-09-10"
+                        :event/announcement-raw "v1 announcement"
+                        :event/receipts #{base-receipt}
+                        :event/recorded-at "2026-09-05"})
+        ev2 (obs/event {:event/kind :asking-change-announced
+                        :event/subject base-subject
+                        :event/jurisdiction "JPN"
+                        :event/effective-at "2026-09-12"
+                        :event/announcement-raw "v2 announcement"
+                        :event/receipts #{base-receipt}
+                        :event/recorded-at "2026-09-08"})
+        d (obs/event-delta ev1 ev2)]
+    (is (= :changed (:event-delta/kind d)))
+    (is (= "v1 announcement" (:event-delta/announcement-prior d)))
+    (is (= "v2 announcement" (:event-delta/announcement-next d)))
+    (is (true? (:event-delta/announcement-not-prediction d)))
+    ;; unchanged case: same announcement re-observed
+    (let [ev3 (obs/event (assoc (dissoc ev2 :event/id :event/method
+                                        :event/contract-version)
+                                :event/recorded-at "2026-09-09"))
+          d2 (obs/event-delta ev2 ev3)]
+      (is (= :unchanged (:event-delta/kind d2))))))
+
+(deftest readback-events-latest-at-or-before
+  (let [h (obs/record-event []
+                           (obs/event {:event/kind :asking-change-announced
+                                       :event/subject base-subject
+                                       :event/jurisdiction "JPN"
+                                       :event/effective-at "2026-09-10"
+                                       :event/announcement-raw "announced"
+                                       :event/receipts #{base-receipt}
+                                       :event/recorded-at "2026-09-05"}))
+        h2 (obs/refresh-event h (:event/id (first h))
+                              (obs/event {:event/kind :asking-change-announced
+                                          :event/subject base-subject
+                                          :event/jurisdiction "JPN"
+                                          :event/effective-at "2026-09-10"
+                                          :event/announcement-raw "announced v2"
+                                          :event/receipts #{base-receipt}
+                                          :event/recorded-at "2026-09-08"}))
+        rb1 (obs/readback-events h2 "L-1" "2026-09-06")
+        rb2 (obs/readback-events h2 "L-1" "2026-09-09")]
+    (is (= "2026-09-05" (:event/recorded-at rb1)))
+    (is (= "2026-09-08" (:event/recorded-at rb2)))
+    (is (nil? (obs/readback-events h2 "L-1" "2026-09-01")))
+    (is (= :readback/bad-as-of
+           (refusal-of #(obs/readback-events h2 "L-1" "soon"))))))
+
+(deftest proposals-carry-boundaries-gaps-and-no-model
+  (let [h (obs/observe [] (base-observation
+                           {:obs/missingness #{:asking-area-unpublished}}))
+        p (obs/hyakka-proposal (first h))]
+    (is (= "fudosan" (:proposal/corpus p)))
+    (is (true? (:proposal/no-model p)))
+    (is (true? (:proposal/props-unregistered p)))
+    (is (contains? (set (:proposal/epistemic-boundaries p))
+                   "listing-asking-price-is-not-a-transaction-price"))
+    (is (contains? (set (:proposal/privacy-boundaries p))
+                   "no-personal-residential-address-linkage"))
+    (is (contains? (set (:proposal/gaps p)) "asking-area-unpublished"))
+    ;; :brokerage-first-party is flagged unmapped-in-scope
+    (is (contains? (set (:proposal/source-class-unmapped p))
+                   "brokerage-first-party"))
+    (is (= 1 (count (:proposal/figure-claims p))))
+    (is (= "fudosan.prop/listing-asking-figure-observation"
+           (get-in p [:proposal/figure-claims 0 :claim/prop])))
+    (is (true? (get-in p [:proposal/figure-claims 0 :claim/asking-not-transaction-price])))))
+
+(deftest event-proposal-is-not-a-prediction
+  (let [ev (obs/event {:event/kind :asking-change-announced
+                       :event/subject base-subject
+                       :event/jurisdiction "JPN"
+                       :event/effective-at "2026-09-10"
+                       :event/announcement-raw "announced"
+                       :event/receipts #{base-receipt}
+                       :event/recorded-at "2026-09-05"})
+        p (obs/hyakka-event-proposal ev)]
+    (is (true? (:proposal/announcement-not-prediction p)))
+    (is (= "2026-09-10" (:proposal/effective-at p)))
+    (is (= "announced" (:proposal/announcement-verbatim p)))
+    (is (true? (:proposal/no-model p)))))
+
+(deftest coverage-is-counts-not-levels
+  (let [h (obs/observe [] (base-observation {}))
+        h2 (obs/refresh h (:obs/id (first h))
+                        (base-observation {:obs/recorded-at "2026-09-02"}))
+        cov (obs/history-coverage h2 "2026-09-02")]
+    (is (= 2 (:coverage/observations cov)))
+    (is (= 1 (:coverage/subjects cov)))
+    (is (= 2 (get-in cov [:coverage/figure-counts :asking-price])))
+    (is (true? (:coverage/no-model cov)))
+    (is (= :coverage/bad-recorded-at
+           (refusal-of #(obs/history-coverage h2 "Q3"))))))
+
+(deftest window-observation-counts-only
+  (let [h (obs/observe [] (base-observation
+                           {:obs/events [{:event/type :asking-price-revised
+                                          :event/publication-ref "pub-1"}]}))
+        w (obs/window-observation (first h))]
+    (is (= 1 (get-in w [:derived/event-counts :asking-price-revised])))
+    (is (= 1 (get-in w [:derived/figure-counts :asking-price])))
+    (is (true? (:derived/no-model w)))))
+
+(deftest hygiene-no-personal-or-address-keys-anywhere
+  (let [h (obs/observe [] (base-observation {}))
+        h2 (obs/record-event h (obs/event {:event/kind :listing-announcement-published
+                                           :event/subject base-subject
+                                           :event/jurisdiction "JPN"
+                                           :event/effective-at "2026-09-10"
+                                           :event/announcement-raw "announced"
+                                           :event/receipts #{base-receipt}
+                                           :event/recorded-at "2026-09-05"}))
+        forbidden #{:address :property-address :street-address :postal-address
+                    :listing-address :location-address :person :person-name
+                    :owner :owner-name :landlord :landlord-name :tenant
+                    :tenant-name :party :parties :party-names :contact :email
+                    :phone :occupancy :household}
+        ;; walk every map key in the frozen history
+        leaked (filter forbidden (mapcat keys h2))]
+    (is (empty? leaked))))

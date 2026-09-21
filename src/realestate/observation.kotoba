@@ -1,0 +1,1191 @@
+(ns realestate.observation
+  "cloud-itonami-isco-3334 listing-observation/1 — a bounded actor contract
+  for REPRODUCIBLE, PROVENANCE-PRESERVING observations over the practice's
+  OWN PUBLISHED LISTING RECORDS (the ISCO-08 3334 actor publishes sale and
+  lease listings and manages property-management procedure). One
+  observation = one frozen reading of ONE published listing record under
+  ONE measurement window.
+
+  What this contract is: source receipts, typed entity/event inputs, a
+  measurement window, currency and area basis, method/version,
+  missingness/coverage flags, derived observations, refresh history,
+  Hyakka proposal shapes and query/readback. What it publishes is
+  OBSERVATIONS ONLY: asking figures as published, publication dates,
+  publication acts. An asking price is an ASKING figure — never a
+  transaction price, never a market value, never a valuation, never an
+  offer, never advice. It validates deterministically and runs offline.
+
+  The twelve contract parts:
+   1. source receipts        -> `receipt`
+   2. typed subject inputs   -> `subject`
+   3. measurement window     -> `:obs/window` {:from :to}
+   4. currency/area basis    -> monetary figures carry ISO-4217 currency +
+                                nominal-at + verbatim raw; area figures
+                                carry a NAMED area unit, verbatim, never
+                                converted
+   5. method/version         -> `contract-version` stamped on every artifact
+   6. missingness/coverage   -> `missingness-flags`, `history-coverage`
+   7. derived observations   -> `window-observation`, `history-coverage`
+   8. refresh history        -> `observe` `refresh` `refresh-delta`
+                                (append-only, verbatim-level)
+   9. Hyakka proposal        -> `hyakka-proposal` (SHAPE ONLY — sends nothing)
+  10. query/readback         -> `readback` `readback-chain`
+  11. loud refusals          -> `refusals` registry
+
+  PLUS (the sibling v2 pattern, carried from day one): a SECOND artifact
+  kind — typed published-change events ABOUT the practice's own listing
+  record (`event` `record-event` `refresh-event` `event-delta`
+  `readback-events` `readback-event-chain` `hyakka-event-proposal`).
+  Events refresh events; observations refresh observations; one artifact
+  kind is never the other's predecessor. Every figure carries its receipt
+  attribution (sole-receipt fallback; attribution among many receipts
+  would be a guess and is refused), so a figure whose receipt moved while
+  its verbatim basis stayed identical is REPORTED as re-attributed, never
+  silently absorbed.
+
+  NO MODEL: no valuation, no market score, no yield, no ranking of
+  properties, neighbourhoods, jurisdictions, vehicles, agents or
+  managers. Counts are observations, not metrics. NO ADVICE: auditable
+  observations only — no investment advice, no purchase, bid, offer,
+  trade or allocation, no outreach, no solicitation, no personal
+  profiling; addresses, party data and personal contact data are refused
+  BY CONSTRUCTION (see `refusals`)."
+  {:author "cloud-itonami real-estate analysis design bot"
+   :scope/workspace "com-junkawasaki"})
+
+;; --- loud refusals -----------------------------------------------------------
+
+(defn- refuse
+  "The contract's only failure mode: a loud, coded ex-info. Never nil,
+  never a default value, never a silent skip."
+  [code msg]
+  (throw (ex-info msg {:refusal/code code})))
+
+(defn refusal-code
+  "The :refusal/code of a refusal ex-info, or nil for other throwables."
+  [e]
+  (get (ex-data e) :refusal/code))
+
+(defn- nonempty-str? [x] (and (string? x) (boolean (re-find #"\S" x))))
+(defn- iso-locale-date? [x] (and (string? x) (boolean (re-matches #"\d{4}-\d{2}-\d{2}" x))))
+(defn- https-url? [x] (and (string? x) (boolean (re-matches #"https://.*" x))))
+
+(def refusals
+  "The refusal registry — every code this contract can raise, as data, so
+  a caller can branch on refusals without parsing messages. Refusing is
+  the contract's core behavior: bad provenance, personal data, cross-
+  subject links and silence-claims-completeness never enter a history."
+  #{:subject/not-a-map :subject/address-refused :subject/missing-field
+    :subject/unknown-scope
+    :receipt/not-a-map :receipt/missing-field :receipt/https-required
+    :receipt/forbidden-source-class :receipt/unknown-method
+    :receipt/not-a-receipt :receipt/id-mismatch
+    :receipt/cross-jurisdiction-receipt :observation/no-receipts
+    :figure/unknown-kind :figure/missing-field :figure/bad-amount
+    :figure/bad-currency :figure/bad-nominal-at :figure/bad-value
+    :figure/dimensional-without-area-unit :figure/unknown-area-unit
+    :figure/ambiguous-receipt-attribution :figure/receipt-missing
+    :observation/not-a-map :observation/personal-data-refused
+    :observation/address-refused :observation/bad-window
+    :observation/missing-field :observation/no-receipts
+    :observation/unknown-missingness-flag :observation/missingness-not-a-set
+    :observation/bad-recorded-at :obs/silence-claims-completeness
+    :event/unknown-type :event/missing-field :event/personal-data-refused
+    :event/not-an-event :event/unknown-kind :event/bad-effective-at
+    :event/empty-announcement :event/duplicate-event-id
+    :event/refresh-of-unknown :event/refresh-of-self
+    :event/refresh-of-observation :event/refresh-of-cross-subject
+    :event/cross-jurisdiction-receipt
+    :history/duplicate-observation-id :history/subject-scope-conflict
+    :observation/refresh-of-unknown :observation/refresh-of-self
+    :observation/refresh-of-cross-subject :delta/cross-subject
+    :readback/bad-as-of :readback/broken-lineage :readback/cyclic-lineage
+    :readback/chain-cross-subject :coverage/bad-recorded-at
+    :proposal/not-an-observation :proposal/not-an-event})
+
+;; --- version -----------------------------------------------------------------
+
+(def contract-version "The version stamp carried by every frozen artifact."
+  "listing-observation/1")
+
+(def known-versions
+  "Artifacts stamped with an unknown contract version are refused."
+  #{"listing-observation/1"})
+
+;; --- 2. typed subject (a PUBLISHED LISTING RECORD — never a person) ----------
+
+(def subject-scopes
+  "The closed subject-kind vocabulary. A subject is ONE PUBLISHED LISTING
+  RECORD identified by the practice's own opaque listing id (the same id
+  the practice's store uses). A listing record is an OBSERVED PUBLICATION
+  — not a title record, and not evidence of ownership. Address and
+  personal keys cannot enter (privacy by construction; see `refusals`)."
+  #{:first-party-listing :first-party-lease-listing})
+
+(def refused-personal-keys
+  "Keys REFUSED BY CONSTRUCTION wherever they would identify a person, a
+  household or a residential address: a listing observation identifies
+  the publication by opaque id only."
+  #{:address :property-address :street-address :postal-address
+    :listing-address :location-address :person :person-name :owner
+    :owner-name :landlord :landlord-name :tenant :tenant-name :party
+    :parties :party-names :contact :email :phone :occupancy :household})
+
+(defn- personal-key-present? [m]
+  (boolean (some #(contains? m %) refused-personal-keys)))
+
+(defn subject
+  "Validate + return one subject map: an opaque listing id under a
+  declared scope kind. Refuses non-maps, a missing id, an unknown scope
+  kind, and any refused personal/address key."
+  [s]
+  (when-not (map? s)
+    (refuse :subject/not-a-map "subject: not a map"))
+  (when (personal-key-present? s)
+    (refuse :subject/address-refused
+            "subject: an address/personal key is refused by construction —
+             a listing observation identifies the publication by opaque
+             id only"))
+  (when-not (nonempty-str? (:subject/id s))
+    (refuse :subject/missing-field "subject: :subject/id required"))
+  (when-not (contains? subject-scopes (:subject/scope s))
+    (refuse :subject/unknown-scope
+            (str "subject: unknown scope " (:subject/scope s)
+                 " — must come from subject-scopes")))
+  s)
+
+(defn- same-subject? [a b]
+  (= [(:subject/id (:obs/subject a)) (:subject/scope (:obs/subject a))]
+     [(:subject/id (:obs/subject b)) (:subject/scope (:obs/subject b))]))
+
+(defn- same-event-subject? [a b]
+  (= (:subject/id (:event/subject a)) (:subject/id (:event/subject b))))
+
+;; --- 1. source receipts --------------------------------------------------------
+
+(def source-classes
+  "The allowed receipt source classes. The first block is quoted from the
+  workspace real-estate scope's :source-policy :allow;
+  :brokerage-first-party (the practice publishing its own listing) is
+  THIS CONTRACT'S addition and is flagged unmapped-in-scope on every
+  proposal — surfaced, never silently relabelled."
+  #{:official-land-registry :official-cadastre :official-statistics-agency
+    :official-tax-authority :official-regulator :official-securities-filing
+    :official-stock-exchange-filing :official-municipal-planning-authority
+    :official-central-bank :fund-first-party :manager-first-party
+    :brokerage-first-party})
+
+(def forbidden-source-classes
+  "Classes the scope's :source-policy :forbid names. A receipt may never
+  enter with one of these as its source class — snippets, generated
+  summaries, scraped directories and social posts are not provenance."
+  #{:search-snippet :generated-summary :scraped-directory :social-post
+    :broker-list-as-fact :paywall-bypass :captcha-bypass})
+
+(def unmapped-in-scope
+  "Receipt classes this contract accepts that have no scope
+  :source-policy :allow counterpart. Surfaced on every proposal as
+  :proposal/source-class-unmapped — never silently relabelled."
+  #{:brokerage-first-party})
+
+(def methods
+  "The closed receipt observation-method vocabulary."
+  #{:verbatim-citation :official-api})
+
+(defn- derive-receipt-id
+  "Receipt ids are DERIVED, never caller-supplied: jurisdiction, url and
+  observed-at are the receipt's identity, so the same source observed on
+  the same day freezes to the same id and a later observation day
+  derives a new one."
+  [r]
+  (str "receipt:" (:receipt/jurisdiction r) ":"
+       (:receipt/source-url r) ":" (:receipt/observed-at r)))
+
+(defn receipt
+  "Validate + freeze one source receipt, deriving its :receipt/id.
+  Requires the workspace real-estate scope's required common fields
+  carried as DATA: an https source-url, a source-class from
+  `source-classes`, a source-language, observed-at (when we observed) and
+  asserted-at (when the source asserts) as YYYY-MM-DD dates, a
+  content-hash, an issuing entity and a jurisdiction; a method from the
+  closed set; an optional note. Refuses forbidden classes and missing
+  fields."
+  [r]
+  (when-not (map? r)
+    (refuse :receipt/not-a-map "receipt: not a map"))
+  (doseq [k [:receipt/source-url :receipt/source-class :receipt/source-language
+             :receipt/observed-at :receipt/content-hash :receipt/issuing-entity
+             :receipt/jurisdiction :receipt/asserted-at]]
+    (when (nil? (get r k))
+      (refuse :receipt/missing-field
+              (str "receipt: missing required common field " k))))
+  (when-not (https-url? (:receipt/source-url r))
+    (refuse :receipt/https-required "receipt: source-url must be https"))
+  (when (contains? forbidden-source-classes (:receipt/source-class r))
+    (refuse :receipt/forbidden-source-class
+            (str "receipt: source class " (:receipt/source-class r)
+                 " is forbidden by the scope's :source-policy")))
+  (when-not (contains? source-classes (:receipt/source-class r))
+    (refuse :receipt/forbidden-source-class
+            (str "receipt: source class " (:receipt/source-class r)
+                 " is not in source-classes")))
+  (when-not (contains? methods (:receipt/method r))
+    (refuse :receipt/unknown-method
+            (str "receipt: unknown method " (:receipt/method r))))
+  (doseq [k [:receipt/observed-at :receipt/asserted-at]]
+    (when-not (iso-locale-date? (get r k))
+      (refuse :receipt/missing-field (str "receipt: " k " must be YYYY-MM-DD"))))
+  (let [id (derive-receipt-id r)]
+    (when (and (contains? r :receipt/id) (not= (:receipt/id r) id))
+      (refuse :receipt/id-mismatch
+              (str "receipt: supplied id " (:receipt/id r)
+                   " does not match the derived id " id)))
+    (assoc r :receipt/id id)))
+
+(defn revalidate-receipt
+  "Re-validate a receipt carried by a frozen artifact — readback refuses
+  tampered receipts on the way out."
+  [r]
+  (when-not (and (map? r) (contains? r :receipt/id) (contains? r :receipt/method))
+    (refuse :receipt/not-a-receipt
+            "receipt: not a frozen receipt — artifacts are frozen first"))
+  (receipt r))
+
+;; --- 4. figures (verbatim asking figures; area units carried verbatim) --------
+
+(def figure-kinds
+  "The closed figure vocabulary. :asking-price and :asking-rent are
+  PUBLISHED ASKING figures — asking, never transacted, never a market
+  value, never an offer. :asking-area is a dimension under a NAMED
+  measurement unit — not interchangeable with another unit's figure."
+  #{:asking-price :asking-rent :asking-area})
+
+(def area-units
+  "Closed area-unit vocabulary. Units are carried verbatim; no conversion
+  exists in this contract. Area figures under different units are never
+  combined — they are carried side by side."
+  #{:m2 :sqft :jo :tsubo :pyeong :acre})
+
+(def figure-basis-keys
+  "The verbatim basis of a figure. Two figures with the SAME basis under
+  two different receipts are the re-attribution case refresh-delta
+  reports."
+  [:figure/kind :figure/raw :figure/amount :figure/value :figure/currency
+   :figure/nominal-at :figure/area-unit])
+
+(defn figure
+  "Validate + return one figure. Monetary figures (:asking-price,
+  :asking-rent) carry the verbatim raw text, a non-negative integer
+  amount in whole currency units, an ISO-4217 currency and the
+  nominal-at date the amount is nominal at. Dimensional figures
+  (:asking-area) carry a positive value and a NAMED area-unit from the
+  closed vocabulary — never converted, never interchanged. The verbatim
+  raw text is always required: this contract stores the source's own
+  words alongside the typed basis, not a normalisation."
+  [{:figure/keys [kind raw amount currency nominal-at value area-unit]
+    :as f}]
+  (when-not (and (map? f) (contains? figure-kinds kind))
+    (refuse :figure/unknown-kind (str "figure: unknown figure kind " kind)))
+  (when-not (nonempty-str? raw)
+    (refuse :figure/missing-field
+            (str "figure " kind ": :figure/raw (the source's own text) is required")))
+  (if (contains? #{:asking-price :asking-rent} kind)
+    (do (when-not (and (int? amount) (not (neg? amount)))
+          (refuse :figure/bad-amount
+                  "figure: :figure/amount must be a non-negative integer"))
+        (when-not (and (string? currency) (re-matches #"[A-Z]{3}" currency))
+          (refuse :figure/bad-currency
+                  "figure: :figure/currency must be an ISO-4217 code"))
+        (when-not (iso-locale-date? nominal-at)
+          (refuse :figure/bad-nominal-at
+                  "figure: :figure/nominal-at must be a YYYY-MM-DD date")))
+    (do (when-not (and (number? value) (pos? value))
+          (refuse :figure/bad-value
+                  "figure: :figure/value must be a positive number"))
+        (when-not (contains? area-units area-unit)
+          (refuse :figure/dimensional-without-area-unit
+                  (str "figure " kind ": requires an area-unit from " (sort area-units))))))
+  f)
+
+(defn- attribute-figures
+  "Attribute every figure to a receipt id. A figure may name its receipt
+  explicitly (:figure/source); otherwise it falls back to the SOLE
+  receipt of the artifact. With more than one receipt and no named
+  source, attribution would be a guess: refuse."
+  [figures receipts]
+  (vec (for [f figures]
+         (cond
+           (contains? f :figure/source) f
+           (= 1 (count receipts))
+           (assoc f :figure/source (:receipt/id (first (seq receipts))))
+           :else (refuse :figure/ambiguous-receipt-attribution
+                         (str "figure " (:figure/kind f)
+                              " names no receipt and attribution among "
+                              (count receipts) " receipts would be a guess"))))))
+
+(defn- check-figure-attribution
+  "Every attributed figure must name a receipt CARRIED BY the same
+  artifact."
+  [figures receipts]
+  (let [ids (into #{} (map :receipt/id receipts))]
+    (doseq [f figures]
+      (when-not (contains? ids (:figure/source f))
+        (refuse :figure/receipt-missing
+                (str "figure " (:figure/kind f) " names receipt "
+                     (:figure/source f) ", which is not among the receipts"))))))
+
+(defn- validate-figures [figures receipts]
+  (let [attributed (attribute-figures figures receipts)]
+    (doseq [f attributed] (figure f))
+    (check-figure-attribution attributed receipts)
+    attributed))
+
+;; --- 3+6. window and missingness ----------------------------------------------
+
+(def missingness-flags
+  "The closed missingness vocabulary an observation may declare. Chosen
+  from the gaps a listing record's world actually has; extending it is a
+  contract change, not a free-form field."
+  #{:asking-price-unpublished :asking-rent-unpublished
+    :asking-area-unpublished :area-unit-unstated :listing-record-partial})
+
+(defn- require-window [w]
+  (when-not (and (map? w) (contains? w :from) (contains? w :to))
+    (refuse :observation/bad-window
+            "observation: :obs/window {:from :to} required"))
+  (when-not (and (iso-locale-date? (:from w)) (iso-locale-date? (:to w)))
+    (refuse :observation/bad-window
+            "observation: :obs/window must be YYYY-MM-DD dates"))
+  (when (pos? (compare (:from w) (:to w)))
+    (refuse :observation/bad-window
+            "observation: :obs/window :from must not exceed :to"))
+  w)
+
+(defn- require-jurisdiction [j]
+  (when-not (nonempty-str? j)
+    (refuse :observation/missing-field
+            "observation: :obs/jurisdiction is a required common field"))
+  j)
+
+;; --- embedded publication events (in-window publication acts) ------------------
+
+(def event-types
+  "The closed vocabulary of publication acts observed INSIDE a
+  measurement window, each carrying the source's own publication
+  reference. These are the practice's OWN publication acts about its own
+  record — never market acts, never predictions."
+  #{:listing-published :asking-price-revised :asking-rent-revised
+    :listing-terms-revised :listing-status-changed :listing-withdrawn})
+
+(defn- validate-events [events]
+  (doseq [e events]
+    (when-not (map? e)
+      (refuse :event/not-an-event "observation: event is not a map"))
+    (when (personal-key-present? e)
+      (refuse :event/personal-data-refused
+              "observation event: a personal-data key is refused by
+               construction — no owner, landlord, tenant or party is
+               identified, profiled or adjudicated by this contract"))
+    (when-not (contains? event-types (:event/type e))
+      (refuse :event/unknown-type
+              (str "observation: unknown event type " (:event/type e))))
+    (when-not (nonempty-str? (:event/publication-ref e))
+      (refuse :event/missing-field
+              "observation: event requires :event/publication-ref (the
+               source's own reference)"))))
+
+(defn- freeze [m] (assoc m :obs/contract-version contract-version))
+
+(defn- derive-obs-id [s w jurisdiction recorded-at]
+  (str "obs:" (:subject/id s) ":" jurisdiction ":"
+       (:from w) ":" (:to w) ":" recorded-at))
+
+(defn- append-observation
+  "Append a frozen observation to a history that may also carry events.
+  One history, two artifact kinds, one id namespace. Refuses a
+  duplicate id and a re-scoping of an already-recorded subject id."
+  [history o]
+  (when (some #(= (:obs/id %) (:obs/id o)) history)
+    (refuse :history/duplicate-observation-id
+            (str "history: observation id " (:obs/id o) " already recorded")))
+  (when-let [prior (some #(when (= (:subject/id (:obs/subject o))
+                                   (:subject/id (:obs/subject %))) %)
+                         history)]
+    (when-not (= (:subject/scope (:obs/subject o))
+                 (:subject/scope (:obs/subject prior)))
+      (refuse :history/subject-scope-conflict
+              (str "history: subject " (:subject/id (:obs/subject o))
+                   " was recorded as " (:subject/scope (:obs/subject prior))
+                   ", now re-scoped as " (:subject/scope (:obs/subject o))
+                   " — a listing id is not re-scoped into another kind")))) 
+  (conj (vec history) o))
+
+(defn observe
+  "Validate + freeze one observation of ONE published listing record
+  under ONE measurement window, then APPEND it to `history` (append-only
+  in data: nothing is ever mutated in place). Requires: a validated
+  subject (the practice's own opaque listing id under a declared scope
+  kind — an address is refused by construction); a measurement window
+  (:from not after :to, both YYYY-MM-DD); a non-empty :obs/jurisdiction
+  (required common field, carried never inferred); at least one receipt,
+  every receipt of the SAME jurisdiction and revalidated; missingness
+  flags from the closed vocabulary; publication events each naming a
+  closed event type and the source's own publication reference; figures
+  under the verbatim + basis + attribution discipline. The id is DERIVED
+  (subject, jurisdiction, window, recorded-at) so the same record
+  re-observed on a later recording day derives a NEW id that can refresh
+  the prior generation via :obs/refresh-of. SILENCE RULE: an observation
+  carrying no :asking-price and no :asking-rent figure must declare the
+  corresponding :unpublished flag — silence may not claim completeness."
+  [history o]
+  (when-not (map? o)
+    (refuse :observation/not-a-map "observation: not a map"))
+  (when (personal-key-present? o)
+    (refuse :observation/personal-data-refused
+            "observation: an address/personal key is refused by
+             construction — no owner, landlord or tenant is identified,
+             no residential address enters the record"))
+  (when (some #(contains? o %)
+              [:obs/address :obs/street-address :obs/property-address
+               :obs/postal-address :obs/location-address :obs/person
+               :obs/person-name :obs/owner :obs/owner-name :obs/landlord
+               :obs/landlord-name :obs/tenant :obs/tenant-name :obs/party
+               :obs/parties :obs/party-names :obs/contact :obs/email
+               :obs/phone :obs/occupancy :obs/household])
+    (refuse :observation/personal-data-refused
+            "observation: a :obs/ personal-data key is refused by
+             construction — no owner, landlord or tenant is identified,
+             no residential address enters the record"))
+  (let [{s0 :obs/subject, window :obs/window, jurisdiction :obs/jurisdiction,
+         figures0 :obs/figures, events :obs/events, missingness0 :obs/missingness,
+         receipts :obs/receipts, recorded-at :obs/recorded-at} o
+        figures (or figures0 [])
+        events (or events [])
+        missingness (or missingness0 #{})
+        s (subject s0)
+        w (require-window window)
+        j (require-jurisdiction jurisdiction)
+        _ (when-not (iso-locale-date? recorded-at)
+            (refuse :observation/bad-recorded-at
+                    "observation: :obs/recorded-at must be YYYY-MM-DD"))
+        _ (when-not (set? missingness)
+            (refuse :observation/missingness-not-a-set
+                    "observation: :obs/missingness must be a set"))
+        _ (doseq [fl missingness]
+            (when-not (contains? missingness-flags fl)
+              (refuse :observation/unknown-missingness-flag
+                      (str "observation: unknown missingness flag " fl))))
+        _ (when (and (empty? figures)
+                     (not (some #(contains? missingness %)
+                                #{:asking-price-unpublished
+                                  :asking-rent-unpublished})))
+            (refuse :obs/silence-claims-completeness
+                    "observation: no asking figures observed and no
+                     :unpublished flag declared — silence must not claim
+                     completeness"))
+        _ (when-not (set? receipts)
+            (refuse :observation/no-receipts
+                    "observation: receipts must be a set of frozen receipts"))
+        _ (when (empty? receipts)
+            (refuse :observation/no-receipts
+                    "observation: at least one receipt is required — nothing
+                     may be claimed without provenance"))
+        rs (into #{} (map receipt) receipts)
+        _ (doseq [r rs]
+            (when-not (= j (:receipt/jurisdiction r))
+              (refuse :receipt/cross-jurisdiction-receipt
+                      (str "receipt: " (:receipt/id r) " is from "
+                           (:receipt/jurisdiction r) ", observation is about " j))))
+        _ (validate-events events)
+        figures (validate-figures figures rs)]
+    (append-observation
+     history
+     (freeze (assoc o
+                    :obs/id (derive-obs-id s w j recorded-at)
+                    :obs/method contract-version
+                    :obs/subject s
+                    :obs/window w
+                    :obs/jurisdiction j
+                    :obs/figures (vec figures)
+                    :obs/events (vec events)
+                    :obs/missingness missingness
+                    :obs/receipts rs)))))
+
+(defn refresh
+  "Record `o` as a re-observation of the observation named `prior-id`:
+  links it via :obs/refresh-of and appends. Refuses an unknown prior, a
+  self-link (a candidate deriving the prior's own id — same subject,
+  window, jurisdiction and recording day), and — at APPEND time, not
+  only at readout — a link across subjects or scope kinds."
+  [history prior-id o]
+  (let [prior (some #(when (= prior-id (:obs/id %)) %) history)]
+    (when-not prior
+      (refuse :observation/refresh-of-unknown
+              (str "refresh: prior observation " prior-id " not in history")))
+    (when (= prior-id
+             (derive-obs-id (subject (:obs/subject o))
+                            (require-window (:obs/window o))
+                            (require-jurisdiction (:obs/jurisdiction o))
+                            (:obs/recorded-at o)))
+      (refuse :observation/refresh-of-self
+              "refresh: an observation cannot refresh itself"))
+    (when-not (same-subject? prior o)
+      (refuse :observation/refresh-of-cross-subject
+              (str "refresh: " (:obs/id prior) " is about "
+                   (:subject/id (:obs/subject prior))
+                   " but the candidate is about "
+                   (:subject/id (:obs/subject o)))))
+    (observe history (assoc o :obs/refresh-of prior-id))))
+
+;; --- 8b. refresh delta (verbatim-level; no numeric difference anywhere) --------
+
+(defn- keyed-events [obs]
+  (into {} (map (fn [e] [(:event/publication-ref e) e]) (:obs/events obs))))
+
+(defn- keyed-figures [obs]
+  (into {}
+        (map (fn [f] [[(:figure/kind f) (:figure/event-ref f) (:figure/raw f)] f])
+             (:obs/figures obs))))
+
+(defn refresh-delta
+  "The verbatim-level audit of what moved between two frozen observations
+  of the SAME subject: events added / removed / changed, figures added /
+  removed / changed (both sides carried IN FULL), missingness flags added
+  and removed, and the receipt ids of BOTH generations. A figure whose
+  receipt moved while its verbatim basis did not is named in
+  :delta/re-attributed (both receipt ids carried) — re-attribution is
+  reported, never silently absorbed. Computes no numeric difference and
+  normalizes nothing: asking figures at different dates and under
+  different currencies, or area figures under different units, are not
+  comparable — they are only ever carried, side by side, never combined.
+  :delta/kind is :unchanged when nothing moved."
+  [prior next]
+  (when-not (same-subject? prior next)
+    (refuse :delta/cross-subject
+            "delta: the two observations are about different subjects"))
+  (let [pe (keyed-events prior) ne (keyed-events next)
+        pf (keyed-figures prior) nf (keyed-figures next)
+        pm (:obs/missingness prior #{}) nm (:obs/missingness next #{})
+        all-eks (distinct (concat (keys pe) (keys ne)))
+        all-fks (distinct (concat (keys pf) (keys nf)))
+        changed-events (vec (for [k all-eks
+                                  :when (and (contains? pe k) (contains? ne k)
+                                             (not= (get pe k) (get ne k)))]
+                              {:delta/key k :delta/prior (get pe k)
+                               :delta/next (get ne k)}))
+        changed-figures (vec (for [k all-fks
+                                   :when (and (contains? pf k) (contains? nf k)
+                                              (not= (get pf k) (get nf k)))]
+                               {:delta/key k :delta/prior (get pf k)
+                                :delta/next (get nf k)}))
+        added-events (vec (map #(get ne %) (filter #(contains? ne %)
+                                                   (remove #(contains? pe %) (keys ne)))))
+        removed-events (vec (map #(get pe %) (filter #(contains? pe %)
+                                                     (remove #(contains? ne %) (keys pe)))))
+        added-figures (vec (map #(get nf %) (filter #(contains? nf %)
+                                                    (remove #(contains? pf %) (keys nf)))))
+        removed-figures (vec (map #(get pf %) (filter #(contains? pf %)
+                                                      (remove #(contains? nf %) (keys pf)))))
+        re-attributed (vec (for [k all-fks
+                                 :when (and (contains? pf k) (contains? nf k)
+                                            (= (select-keys (get pf k) figure-basis-keys)
+                                               (select-keys (get nf k) figure-basis-keys))
+                                            (not= (:figure/source (get pf k))
+                                                  (:figure/source (get nf k))))]
+                             {:delta/key k
+                              :delta/prior-receipt (:figure/source (get pf k))
+                              :delta/next-receipt (:figure/source (get nf k))}))
+        gap-added (vec (sort (map name (remove #(contains? pm %) nm))))
+        gap-removed (vec (sort (map name (remove #(contains? nm %) pm))))
+        moved? (or (seq added-events) (seq removed-events) (seq changed-events)
+                   (seq added-figures) (seq removed-figures) (seq changed-figures)
+                   (seq gap-added) (seq gap-removed) (seq re-attributed))]
+    (freeze
+     {:delta/kind (if moved? :changed :unchanged)
+      :delta/subject-id (:subject/id (:obs/subject prior))
+      :delta/prior-id (:obs/id prior) :delta/next-id (:obs/id next)
+      :delta/prior-receipts (vec (sort (map :receipt/id (:obs/receipts prior))))
+      :delta/next-receipts (vec (sort (map :receipt/id (:obs/receipts next))))
+      :delta/added-events added-events :delta/removed-events removed-events
+      :delta/changed-events changed-events
+      :delta/added-figures added-figures :delta/removed-figures removed-figures
+      :delta/changed-figures changed-figures
+      :delta/re-attributed re-attributed
+      :delta/gap-added gap-added :delta/gap-removed gap-removed
+      :delta/comparability-note
+      "verbatim-level only; no numeric difference is computed; asking
+       figures at different dates and under different currencies, and
+       area figures under different units, are carried side by side,
+       never combined"
+      :delta/contract-version contract-version})))
+
+;; --- 7. derived observations (COUNTS, never levels or trends) ------------------
+
+(defn window-observation
+  "The derived, per-subject reading of ONE frozen observation: in-window
+  event counts by type, the verbatim publication references, figure
+  counts by kind, the missingness carried forward, the receipt ids. A
+  count of what the receipts show — not a price level, not a market
+  measure, not a trend, and carrying no amounts at all."
+  [obs]
+  (freeze
+   {:derived/contract-version contract-version
+    :derived/subject-id (:subject/id (:obs/subject obs))
+    :derived/window (:obs/window obs)
+    :derived/event-counts (frequencies (map :event/type (:obs/events obs)))
+    :derived/publication-refs (vec (sort (map :event/publication-ref
+                                              (:obs/events obs))))
+    :derived/figure-counts (frequencies (map :figure/kind (:obs/figures obs)))
+    :derived/missingness (:obs/missingness obs #{})
+    :derived/receipt-ids (vec (sort (map :receipt/id (:obs/receipts obs))))
+    :derived/no-model true
+    :derived/note
+    "counts are coverage-limited observations of what the receipts show —
+     not a price level, not a market measure, not a trend"}))
+
+(defn history-coverage
+  "The derived, history-level reading of a recorded history: how many
+  observations and events, how many distinct subjects, figure counts by
+  kind, event counts by type, missingness-flag counts, receipt count —
+  COUNTS over what the history itself carries, plus the honest note that
+  coverage is a goal, not a completeness claim."
+  [history recorded-at]
+  (when-not (iso-locale-date? recorded-at)
+    (refuse :coverage/bad-recorded-at
+            "coverage: recorded-at must be YYYY-MM-DD"))
+  (let [obss (filter #(contains? % :obs/id) history)
+        evs (filter event-frozen? history)
+        flag-counts (frequencies (mapcat :obs/missingness obss))]
+    (freeze
+     {:coverage/contract-version contract-version
+      :coverage/recorded-at recorded-at
+      :coverage/observations (count obss)
+      :coverage/events (count evs)
+      :coverage/subjects (count (distinct (map #(get-in % [:obs/subject :subject/id]) obss)))
+      :coverage/figure-counts (frequencies (mapcat :figure/kind (mapcat :obs/figures obss)))
+      :coverage/event-counts (frequencies (mapcat :event/type (mapcat :obs/events obss)))
+      :coverage/missingness-counts flag-counts
+      :coverage/receipt-count (count (distinct (mapcat :obs/receipts obss)))
+      :coverage/no-model true
+      :coverage/note
+      "coverage is a goal, not a completeness claim — counts describe
+       what this history carries, nothing more"})))
+
+;; --- 10. query / readback ------------------------------------------------------
+
+(defn- obs-frozen? [m] (and (map? m) (contains? m :obs/id) (contains? m :obs/method)))
+
+(defn- revalidate-observation [obs]
+  (doseq [r (:obs/receipts obs)] (revalidate-receipt r))
+  (doseq [f (:obs/figures obs)] (figure f))
+  (check-figure-attribution (:obs/figures obs) (:obs/receipts obs))
+  (subject (:obs/subject obs))
+  obs)
+
+(defn readback
+  "The latest observation for `subject-id` whose :obs/recorded-at is at
+  or before `as-of`, re-validating everything it returns (receipts,
+  figures, attribution, subject) and refusing tampered artifacts on the
+  way out. A miss is a miss: nil, never a default."
+  [history subject-id as-of]
+  (when-not (iso-locale-date? as-of)
+    (refuse :readback/bad-as-of "readback: as-of must be YYYY-MM-DD"))
+  (let [candidates (filter #(and (obs-frozen? %)
+                                 (= subject-id (:subject/id (:obs/subject %)))
+                                 (not (pos? (compare (:obs/recorded-at %) as-of))))
+                           history)]
+    (when-let [obs (last (sort-by :obs/recorded-at candidates))]
+      (revalidate-observation obs))))
+
+(defn readback-chain
+  "The full :obs/refresh-of lineage for a subject, OLDEST FIRST, every
+  generation revalidated on the way out. Refuses a lineage whose link
+  points at an unknown id (:readback/broken-lineage), a cyclic lineage
+  (:readback/cyclic-lineage), and a chain element about another subject
+  (:readback/chain-cross-subject). Returns the chain plus the pairwise
+  deltas aligned to it (n-1 deltas for n generations)."
+  [history subject-id]
+  (let [by-id (into {} (map (fn [o] [(:obs/id o) o])
+                            (filter obs-frozen? history)))
+        latest (last (filter #(and (obs-frozen? %)
+                                   (= subject-id (:subject/id (:obs/subject %))))
+                             (sort-by :obs/recorded-at history)))]
+    (when latest
+      (loop [cur latest, acc (), seen #{}]
+        (when (contains? seen (:obs/id cur))
+          (refuse :readback/cyclic-lineage
+                  (str "readback: lineage cycles at " (:obs/id cur))))
+        (let [acc (conj acc cur), seen (conj seen (:obs/id cur))]
+          (revalidate-observation cur)
+          (when-not (= subject-id (:subject/id (:obs/subject cur)))
+            (refuse :readback/chain-cross-subject
+                    (str "readback: chain element " (:obs/id cur)
+                         " is about " (:subject/id (:obs/subject cur)))))
+          (if-let [pid (:obs/refresh-of cur)]
+            (let [parent (get by-id pid)]
+              (when-not parent
+                (refuse :readback/broken-lineage
+                        (str "readback: " (:obs/id cur) " refreshes " pid
+                             ", which is not in history")))
+              (recur parent acc seen))
+            (let [chain (vec acc)]
+              {:chain chain
+               :deltas (vec (map (fn [[a b]] (refresh-delta a b))
+                                 (partition 2 1 chain)))})))))))
+
+;; --- 13. typed published-change events ------------------------------------------
+
+(def published-change-kinds
+  "The closed vocabulary of the SECOND artifact kind: announcements ABOUT
+  the practice's own listing record that a source PUBLISHES (typically
+  the practice itself, first-party). An announcement is an observation
+  OF a publication: :event/effective-at is the date the SOURCE states a
+  change takes effect, carried as a typed ISO date, never computed and
+  never inferred (an announcement read today may take effect next year,
+  which is not a claim about the future). An announcement never predicts
+  anything."
+  #{:listing-announcement-published :asking-change-announced
+    :terms-change-announced :status-change-announced :withdrawal-announced})
+
+(defn- derive-event-id [ev s]
+  (str "evt:" (:event/jurisdiction ev) ":" (:subject/id s) ":"
+       (name (:event/kind ev)) ":" (:event/effective-at ev) ":"
+       (:event/recorded-at ev)))
+
+(defn event
+  "Validate + freeze one published-change event. Requires: a kind from
+  the closed `published-change-kinds` vocabulary; the SAME subject
+  authority as observations (a validated subject map — the practice's
+  own opaque listing id, never an address); the source-stated
+  :event/effective-at as a typed ISO date (never computed); the source's
+  own words on :event/announcement-raw (absent = :event/missing-field,
+  present-but-blank = :event/empty-announcement — an event without the
+  source's words is a rumor); at least one receipt, every receipt of the
+  SAME jurisdiction and revalidated; figures under the SAME verbatim +
+  basis + attribution discipline as observations; missingness from the
+  closed vocabulary. Party and personal data are refused
+  (:event/personal-data-refused). The id is DERIVED (jurisdiction,
+  subject, kind, effective-at, recorded-at) so the same announcement
+  re-observed on a later recording day derives a NEW id that can refresh
+  the prior generation via :event/refresh-of."
+  [{:event/keys [kind jurisdiction effective-at announcement-raw
+                 figures missingness receipts recorded-at]
+    :event/subject s0
+    :or {figures [] missingness #{}}
+    :as ev}]
+  (when-not (map? ev)
+    (refuse :event/not-an-event "event: not a map"))
+  (when (personal-key-present? ev)
+    (refuse :event/personal-data-refused
+            "event: a personal-data key is refused by construction — no
+             owner, landlord or tenant is identified, profiled or
+             adjudicated by this contract"))
+  (when (some #(contains? ev %)
+              [:event/address :event/street-address :event/property-address
+               :event/postal-address :event/location-address :event/person
+               :event/person-name :event/owner :event/owner-name
+               :event/landlord :event/landlord-name :event/tenant
+               :event/tenant-name :event/party :event/parties
+               :event/party-names :event/contact :event/email :event/phone
+               :event/occupancy :event/household])
+    (refuse :event/personal-data-refused
+            "event: a :event/ personal-data key is refused by
+             construction — no owner, landlord or tenant is identified,
+             profiled or adjudicated by this contract"))
+  (when-not (contains? published-change-kinds kind)
+    (refuse :event/unknown-kind
+            (str "event: unknown published-change kind " kind)))
+  (when-not (nonempty-str? jurisdiction)
+    (refuse :event/missing-field "event: :event/jurisdiction required"))
+  (when (nil? announcement-raw)
+    (refuse :event/missing-field
+            "event: :event/announcement-raw required — the source's own words"))
+  (when-not (nonempty-str? announcement-raw)
+    (refuse :event/empty-announcement
+            "event: the source's own words are required — an empty
+             announcement is a rumor dressed as whitespace"))
+  (when-not (iso-locale-date? effective-at)
+    (refuse :event/bad-effective-at
+            (str "event: effective-at must be a YYYY-MM-DD date AS STATED
+                  BY THE SOURCE, got: " effective-at)))
+  (when-not (iso-locale-date? recorded-at)
+    (refuse :event/missing-field
+            "event: :event/recorded-at must be YYYY-MM-DD — the recording
+             run's date; the announcement's own date is effective-at"))
+  (when-not (set? missingness)
+    (refuse :event/missing-field "event: :event/missingness must be a set"))
+  (doseq [fl missingness]
+    (when-not (contains? missingness-flags fl)
+      (refuse :event/missing-field
+              (str "event: unknown missingness flag " fl))))
+  (when-not (set? receipts)
+    (refuse :event/missing-field "event: receipts must be a set"))
+  (when (empty? receipts)
+    (refuse :observation/no-receipts
+            "event: at least one source receipt required"))
+  (doseq [r receipts]
+    (revalidate-receipt r)
+    (when-not (= jurisdiction (:receipt/jurisdiction r))
+      (refuse :event/cross-jurisdiction-receipt
+              (str "event: receipt " (:receipt/id r) " is from "
+                   (:receipt/jurisdiction r) ", event is about " jurisdiction))))
+  (let [s (subject s0)
+        rs (into #{} (map receipt) receipts)
+        attributed (validate-figures figures rs)]
+    (freeze (assoc ev
+                   :event/method contract-version
+                   :event/id (derive-event-id ev s)
+                   :event/subject s
+                   :event/figures attributed
+                   :event/missingness missingness
+                   :event/receipts rs))))
+
+(defn- append-event
+  "Append a frozen event to a history that may also carry observations.
+  One history, two artifact kinds, one id namespace: an event id
+  colliding with an observation id is the same refusal."
+  [history ev]
+  (when-not (event-frozen? ev)
+    (refuse :event/not-an-event
+            "history: not a frozen event — freeze it with `event` first"))
+  (let [id (:event/id ev)]
+    (when (some #(or (= (:event/id %) id) (= (:obs/id %) id)) history)
+      (refuse :event/duplicate-event-id
+              (str "event: id " id " is already recorded — a re-observation
+                    of the same announcement recorded on a later day
+                    derives a new id and refreshes this one"))))
+  (conj (vec history) ev))
+
+(defn record-event
+  "Append a frozen event with NO lineage link (a first observation of an
+  announcement). Pure, append-only in data."
+  [history ev]
+  (append-event history ev))
+
+(defn refresh-event
+  "Record `ev` as a re-observation of the event named `prior-id`: links
+  it via :event/refresh-of and appends. Refuses an unknown prior, a
+  self-link, a prior that is an OBSERVATION id
+  (:event/refresh-of-observation — events refresh events, observations
+  refresh observations), and at APPEND time — not only at readout — a
+  prior about a different subject."
+  [history prior-id ev]
+  (when-not (event-frozen? ev)
+    (refuse :event/not-an-event
+            "refresh-event takes a frozen event from `event`, not a raw map"))
+  (when (= prior-id (:event/id ev))
+    (refuse :event/refresh-of-self
+            "refresh-event: an event cannot refresh itself"))
+  (let [parent (some #(when (or (= (:event/id %) prior-id) (= (:obs/id %) prior-id)) %)
+                     history)]
+    (when-not parent
+      (refuse :event/refresh-of-unknown
+              (str "refresh-event: prior event " prior-id " not in history")))
+    (when (contains? parent :obs/contract-version)
+      (refuse :event/refresh-of-observation
+              (str "refresh-event: " prior-id " is an OBSERVATION id —
+                    events refresh events, observations refresh
+                    observations; one artifact kind is never the other's
+                    predecessor")))
+    (when-not (same-event-subject? parent ev)
+      (refuse :event/refresh-of-cross-subject
+              (str "refresh-event: " (:event/id ev) " is about "
+                   (:subject/id (:event/subject ev))
+                   " but claims to refresh " prior-id " about "
+                   (:subject/id (:event/subject parent))))))
+  (append-event history (assoc ev :event/refresh-of prior-id)))
+
+(defn- keyed-event-figures [ev]
+  (into {} (map (fn [f] [[(:figure/kind f) (:figure/raw f)] f])
+                (:event/figures ev))))
+
+(defn event-delta
+  "The verbatim-level audit of what moved between two frozen events of
+  the SAME subject: the announcement text, the kind as published, the
+  source-stated effective date, figures added / removed / changed (both
+  sides carried IN FULL on their bases), missingness movement, and the
+  receipt ids of BOTH generations. Computes no numeric difference,
+  normalizes nothing, and predicts nothing — :event-delta/announcement-
+  not-prediction is data here, not prose. :event-delta/kind is
+  :unchanged when nothing but the receipts moved — the 'same
+  announcement re-observed' case an auditor looks for."
+  [prior next]
+  (when-not (event-frozen? prior)
+    (refuse :event/not-an-event "event-delta: prior must be a frozen event"))
+  (when-not (event-frozen? next)
+    (refuse :event/not-an-event "event-delta: next must be a frozen event"))
+  (when-not (same-event-subject? prior next)
+    (refuse :delta/cross-subject
+            (str "event-delta: the two events are about different subjects: "
+                 (:subject/id (:event/subject prior)) " vs "
+                 (:subject/id (:event/subject next)))))
+  (let [pf (keyed-event-figures prior) nf (keyed-event-figures next)
+        pm (:event/missingness prior #{}) nm (:event/missingness next #{})
+        all-fks (distinct (concat (keys pf) (keys nf)))
+        changed-figures (vec (for [k all-fks
+                                   :when (and (contains? pf k) (contains? nf k)
+                                              (not= (get pf k) (get nf k)))]
+                               {:delta/key k :delta/prior (get pf k)
+                                :delta/next (get nf k)}))
+        added-figures (vec (map #(get nf %) (filter #(contains? nf %)
+                                                    (remove #(contains? pf %) (keys nf)))))
+        removed-figures (vec (map #(get pf %) (filter #(contains? pf %)
+                                                      (remove #(contains? nf %) (keys pf)))))
+        gap-added (vec (sort (map name (remove #(contains? pm %) nm))))
+        gap-removed (vec (sort (map name (remove #(contains? nm %) pm))))
+        announcement-changed? (not= (:event/announcement-raw prior)
+                                    (:event/announcement-raw next))
+        kind-changed? (not= (:event/kind prior) (:event/kind next))
+        effective-changed? (not= (:event/effective-at prior)
+                                 (:event/effective-at next))
+        moved? (or announcement-changed? kind-changed? effective-changed?
+                   (seq added-figures) (seq removed-figures) (seq changed-figures)
+                   (seq gap-added) (seq gap-removed))]
+    (freeze
+     {:event-delta/kind (if moved? :changed :unchanged)
+      :event-delta/subject-id (:subject/id (:event/subject prior))
+      :event-delta/prior-id (:event/id prior) :event-delta/next-id (:event/id next)
+      :event-delta/announcement-changed announcement-changed?
+      :event-delta/announcement-prior (:event/announcement-raw prior)
+      :event-delta/announcement-next (:event/announcement-raw next)
+      :event-delta/kind-prior (:event/kind prior)
+      :event-delta/kind-next (:event/kind next)
+      :event-delta/effective-at-prior (:event/effective-at prior)
+      :event-delta/effective-at-next (:event/effective-at next)
+      :event-delta/prior-receipts (vec (sort (map :receipt/id (:event/receipts prior))))
+      :event-delta/next-receipts (vec (sort (map :receipt/id (:event/receipts next))))
+      :event-delta/added-figures added-figures
+      :event-delta/removed-figures removed-figures
+      :event-delta/changed-figures changed-figures
+      :event-delta/gap-added gap-added :event-delta/gap-removed gap-removed
+      :event-delta/announcement-not-prediction true
+      :event-delta/comparability-note
+      "verbatim-level only; the effective date is the source's own stated
+       date carried side by side, never recomputed, never predicted"
+      :event-delta/contract-version contract-version})))
+
+(defn readback-events
+  "The latest published-change event for `subject-id` whose
+  :event/recorded-at is at or before `as-of`, revalidating everything it
+  returns (receipts, figures, attribution, subject) and refusing
+  tampered artifacts on the way out. A miss is a miss: nil, never a
+  default. Only frozen EVENTS answer here — an observation for the same
+  subject does not masquerade as an event."
+  [history subject-id as-of]
+  (when-not (iso-locale-date? as-of)
+    (refuse :readback/bad-as-of "readback-events: as-of must be YYYY-MM-DD"))
+  (let [candidates (filter #(and (event-frozen? %)
+                                 (= subject-id (:subject/id (:event/subject %)))
+                                 (not (pos? (compare (:event/recorded-at %) as-of))))
+                           history)]
+    (when-let [ev (last (sort-by :event/recorded-at candidates))]
+      (doseq [r (:event/receipts ev)] (revalidate-receipt r))
+      (doseq [f (:event/figures ev)] (figure f))
+      (check-figure-attribution (:event/figures ev) (:event/receipts ev))
+      (subject (:event/subject ev))
+      ev)))
+
+(defn readback-event-chain
+  "The full :event/refresh-of lineage for a subject, OLDEST FIRST, every
+  generation revalidated on the way out. Refuses a lineage whose link
+  points at an unknown id (:readback/broken-lineage), at an OBSERVATION
+  id (:event/refresh-of-observation — one artifact kind is never the
+  other's predecessor), a cyclic lineage (:readback/cyclic-lineage), and
+  a chain element about another subject (:readback/chain-cross-subject).
+  Returns the chain plus the pairwise event deltas aligned to it (n-1
+  deltas for n generations)."
+  [history subject-id]
+  (let [obs-ids (into #{} (map :obs/id) (filter obs-frozen? history))
+        by-id (into {} (map (fn [ev] [(:event/id ev) ev])
+                            (filter event-frozen? history)))
+        latest (last (filter #(and (event-frozen? %)
+                                   (= subject-id (:subject/id (:event/subject %))))
+                             (sort-by :event/recorded-at history)))]
+    (when latest
+      (loop [cur latest, acc (), seen #{}]
+        (when (contains? seen (:event/id cur))
+          (refuse :readback/cyclic-lineage
+                  (str "readback: event lineage cycles at " (:event/id cur))))
+        (let [acc (conj acc cur), seen (conj seen (:event/id cur))]
+          (doseq [r (:event/receipts cur)] (revalidate-receipt r))
+          (doseq [f (:event/figures cur)] (figure f))
+          (check-figure-attribution (:event/figures cur) (:event/receipts cur))
+          (subject (:event/subject cur))
+          (when-not (= subject-id (:subject/id (:event/subject cur)))
+            (refuse :readback/chain-cross-subject
+                    (str "readback: event chain element " (:event/id cur)
+                         " is about " (:subject/id (:event/subject cur)))))
+          (if-let [pid (:event/refresh-of cur)]
+            (let [parent (or (get by-id pid)
+                             (when (contains? obs-ids pid) :observation))]
+              (when-not parent
+                (refuse :readback/broken-lineage
+                        (str "readback: " (:event/id cur) " refreshes " pid
+                             ", which is not in history")))
+              (when (= :observation parent)
+                (refuse :event/refresh-of-observation
+                        (str "readback: " (:event/id cur) " refreshes " pid
+                             ", which is an OBSERVATION id — events refresh
+                              events, observations refresh observations")))
+              (recur parent acc seen))
+            (let [chain (vec acc)]
+              {:chain chain
+               :deltas (vec (map (fn [[a b]] (event-delta a b))
+                                 (partition 2 1 chain)))})))))))
+
+;; --- 9. epistemic + privacy boundaries (quoted as DATA) --------------------------
+
+(def epistemic-boundaries
+  "The scope's epistemic boundaries this contract operates under, quoted
+  as data so every proposal carries them instead of assuming them. The
+  first is the scope's own: a listing's asking price is not a
+  transaction price."
+  #{:listing-asking-price-is-not-a-transaction-price
+    :asking-figure-is-not-an-offer-or-invitation-to-contract
+    :a-listing-record-is-not-a-title-or-ownership-record
+    :area-figures-differ-by-measurement-standard-and-are-not-interchangeable
+    :currency-amounts-are-nominal-at-their-own-date-not-comparable-without-a-stated-basis
+    :missing-is-unmeasured
+    :worldwide-is-a-coverage-goal-not-a-completeness-claim
+    :no-model-deterministic-validation-only})
+
+(def privacy-boundaries
+  "The scope's privacy boundaries enforced BY CONSTRUCTION here (see
+  `refusals`): addresses and party data cannot enter an observation or
+  event, and no ranking of agents or managers is produced."
+  #{:legal-entities-and-public-professional-roles-only
+    :no-natural-person-owner-identification
+    :no-personal-residential-address-linkage
+    :no-occupancy-or-household-data
+    :no-personal-contact-data :no-personal-wealth
+    :no-sensitive-trait-inference :no-neighbourhood-desirability-ranking
+    :no-manager-or-agency-ranking})
+
+;; --- 9b. hyakka proposal (SHAPE — this contract transmits nothing) ----------------
+
+(defn- claim-shapes
+  "One claim shape per figure kind. Asking figures propose as asking
+  figures — amount, currency and nominal-at carried; area proposes with
+  its named unit, verbatim, never converted."
+  [subject f gaps]
+  (if (contains? #{:asking-price :asking-rent} (:figure/kind f))
+    {:claim/prop "fudosan.prop/listing-asking-figure-observation"
+     :claim/subject-id (:subject/id subject)
+     :claim/subject-scope (:subject/scope subject)
+     :claim/figure-kind (:figure/kind f)
+     :claim/value-verbatim (:figure/raw f)
+     :claim/amount (:figure/amount f)
+     :claim/currency (:figure/currency f)
+     :claim/nominal-at (:figure/nominal-at f)
+     :claim/asking-not-transaction-price true
+     :claim/receipt-id (:figure/source f)
+     :claim/gaps gaps}
+    {:claim/prop "fudosan.prop/listing-asking-area-observation"
+     :claim/subject-id (:subject/id subject)
+     :claim/subject-scope (:subject/scope subject)
+     :claim/figure-kind (:figure/kind f)
+     :claim/value-verbatim (:figure/raw f)
+     :claim/value (:figure/value f)
+     :claim/area-unit (:figure/area-unit f)
+     :claim/units-carried-verbatim-never-converted true
+     :claim/receipt-id (:figure/source f)
+     :claim/gaps gaps}))
+
+(defn hyakka-proposal
+  "The exact claim shapes proposed to the `fudosan` corpus: one claim per
+  verbatim figure plus one per observed subject, each carrying its
+  receipt, value, basis, window and gaps; plus the scope's epistemic and
+  privacy boundaries and :no-model true. Prop names are contract-local
+  and NOT registered in the Hyakka ontology — the proposal says so
+  (:proposal/props-unregistered). Receipt classes without a scope
+  counterpart are flagged :proposal/source-class-unmapped. This returns
+  DATA for the proposing run to carry; nothing is sent anywhere by this
+  contract."
+  [obs]
+  (when-not (and (map? obs) (contains? known-versions (:obs/contract-version obs)))
+    (refuse :proposal/not-an-observation
+            "proposal: not an observation of this contract"))
+  (let [subject (:obs/subject obs)
+        window (:obs/window obs)
+        gaps (vec (sort (map name (:obs/missingness obs #{}))))
+        figure-claims (vec (map #(claim-shapes subject % gaps)
+                                (:obs/figures obs)))
+        subject-claim
+        {:claim/prop "fudosan.prop/listing-record-publication-in-window"
+         :claim/subject-id (:subject/id subject)
+         :claim/subject-scope (:subject/scope subject)
+         :claim/event-counts (frequencies (map :event/type (:obs/events obs)))
+         :claim/window window
+         :claim/receipt-ids (vec (sort (map :receipt/id (:obs/receipts obs))))
+         :claim/gaps gaps}
+        unmapped (vec (sort (map name (filter #(contains? unmapped-in-scope %)
+                                              (map :receipt/source-class
+                                                   (:obs/receipts obs))))))]
+    (freeze
+     {:proposal/corpus "fudosan"
+      :proposal/target "network-awai/app-hyakka"
+      :proposal/contract-version contract-version
+      :proposal/kind :listing-observation
+      :proposal/subject-id (:subject/id subject)
+      :proposal/subject-scope (:subject/scope subject)
+      :proposal/jurisdiction (:obs/jurisdiction obs)
+      :proposal/window window
+      :proposal/figure-claims figure-claims
+      :proposal/subject-claims [subject-claim]
+      :proposal/epistemic-boundaries (vec (sort (map name epistemic-boundaries)))
+      :proposal/privacy-boundaries (vec (sort (map name privacy-boundaries)))
+      :proposal/gaps gaps
+      :proposal/no-model true
+      :proposal/props-unregistered true
+      :proposal/source-class-unmapped unmapped
+      :proposal/note
+      "SHAPE ONLY — this proposal is data for the proposing run to carry;
+       this contract sends nothing anywhere. An asking figure is an
+       asking figure: never a transaction price, never a market value,
+       never a valuation, never an offer, never advice."})))
+
+(defn hyakka-event-proposal
+  "The proposal shape for one frozen published-change event: the
+  announcement verbatim, the source-stated effective date CARRIED (never
+  recomputed), the receipts, any event figures, the gaps, the
+  boundaries, and :announcement-not-prediction true — an announcement
+  about the practice's own listing record is an observation of a
+  publication, never a prediction, never a market act, never a fee
+  anyone should pay, never advice. Prop names are contract-local and NOT
+  registered in the Hyakka ontology (:proposal/props-unregistered). This
+  returns DATA for the proposing run to carry; nothing is sent anywhere
+  by this contract."
+  [ev]
+  (when-not (event-frozen? ev)
+    (refuse :proposal/not-an-event "proposal: not a frozen event"))
+  (let [subject (:event/subject ev)
+        gaps (vec (sort (map name (:event/missingness ev #{}))))
+        figure-claims (vec (map #(claim-shapes subject % gaps)
+                                (:event/figures ev)))]
+    (freeze
+     {:proposal/corpus "fudosan"
+      :proposal/target "network-awai/app-hyakka"
+      :proposal/contract-version contract-version
+      :proposal/kind :published-change-event
+      :proposal/event-id (:event/id ev)
+      :proposal/event-kind (:event/kind ev)
+      :proposal/subject-id (:subject/id subject)
+      :proposal/subject-scope (:subject/scope subject)
+      :proposal/jurisdiction (:event/jurisdiction ev)
+      :proposal/announcement-verbatim (:event/announcement-raw ev)
+      :proposal/effective-at (:event/effective-at ev)
+      :proposal/recorded-at (:event/recorded-at ev)
+      :proposal/receipt-ids (vec (sort (map :receipt/id (:event/receipts ev))))
+      :proposal/figure-claims figure-claims
+      :proposal/gaps gaps
+      :proposal/announcement-not-prediction true
+      :proposal/no-model true
+      :proposal/props-unregistered true
+      :proposal/epistemic-boundaries (vec (sort (map name epistemic-boundaries)))
+      :proposal/privacy-boundaries (vec (sort (map name privacy-boundaries)))
+      :proposal/note
+      "SHAPE ONLY — an announcement ABOUT the practice's own listing
+       record is observed; its effective date is the source's own stated
+       date, carried, never computed or predicted; this proposal is data
+       for the proposing run to carry; this contract sends nothing
+       anywhere"})))

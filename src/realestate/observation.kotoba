@@ -87,7 +87,7 @@
     :figure/ambiguous-receipt-attribution :figure/receipt-missing
     :observation/not-a-map :observation/personal-data-refused
     :observation/address-refused :observation/bad-window
-    :observation/missing-field :observation/no-receipts
+    :observation/missing-field
     :observation/unknown-missingness-flag :observation/missingness-not-a-set
     :observation/bad-recorded-at :obs/silence-claims-completeness
     :event/unknown-type :event/missing-field :event/personal-data-refused
@@ -382,7 +382,7 @@
     (when-not (map? e)
       (refuse :event/not-an-event "observation: event is not a map"))
     (when (personal-key-present? e)
-      (refuse :event/personal-data-refused
+      (refuse :observation/personal-data-refused
               "observation event: a personal-data key is refused by
                construction — no owner, landlord, tenant or party is
                identified, profiled or adjudicated by this contract"))
@@ -643,6 +643,22 @@
     "counts are coverage-limited observations of what the receipts show —
      not a price level, not a market measure, not a trend"}))
 
+(defn- obs-frozen? [m] (and (map? m) (contains? m :obs/id) (contains? m :obs/method)))
+(defn- event-frozen?
+  "A frozen event carries :event/id, :event/kind and :event/recorded-at —
+  the shape `event` produces and every event-side entry point requires.
+  Mirrors `obs-frozen?`: one artifact kind is never the other's
+  predecessor, so each kind has its own frozen-shape predicate."
+  [m] (and (map? m) (contains? m :event/id) (contains? m :event/kind)
+           (contains? m :event/recorded-at)))
+
+(defn- revalidate-observation [obs]
+  (doseq [r (:obs/receipts obs)] (revalidate-receipt r))
+  (doseq [f (:obs/figures obs)] (figure f))
+  (check-figure-attribution (:obs/figures obs) (:obs/receipts obs))
+  (subject (:obs/subject obs))
+  obs)
+
 (defn history-coverage
   "The derived, history-level reading of a recorded history: how many
   observations and events, how many distinct subjects, figure counts by
@@ -662,8 +678,8 @@
       :coverage/observations (count obss)
       :coverage/events (count evs)
       :coverage/subjects (count (distinct (map #(get-in % [:obs/subject :subject/id]) obss)))
-      :coverage/figure-counts (frequencies (mapcat :figure/kind (mapcat :obs/figures obss)))
-      :coverage/event-counts (frequencies (mapcat :event/type (mapcat :obs/events obss)))
+      :coverage/figure-counts (frequencies (map :figure/kind (mapcat :obs/figures obss)))
+      :coverage/event-counts (frequencies (map :event/type (mapcat :obs/events obss)))
       :coverage/missingness-counts flag-counts
       :coverage/receipt-count (count (distinct (mapcat :obs/receipts obss)))
       :coverage/no-model true
@@ -672,15 +688,6 @@
        what this history carries, nothing more"})))
 
 ;; --- 10. query / readback ------------------------------------------------------
-
-(defn- obs-frozen? [m] (and (map? m) (contains? m :obs/id) (contains? m :obs/method)))
-
-(defn- revalidate-observation [obs]
-  (doseq [r (:obs/receipts obs)] (revalidate-receipt r))
-  (doseq [f (:obs/figures obs)] (figure f))
-  (check-figure-attribution (:obs/figures obs) (:obs/receipts obs))
-  (subject (:obs/subject obs))
-  obs)
 
 (defn readback
   "The latest observation for `subject-id` whose :obs/recorded-at is at
@@ -768,9 +775,11 @@
   subject, kind, effective-at, recorded-at) so the same announcement
   re-observed on a later recording day derives a NEW id that can refresh
   the prior generation via :event/refresh-of."
-  [{:event/keys [kind jurisdiction effective-at announcement-raw
-                 figures missingness receipts recorded-at]
-    :event/subject s0
+  [{s0 :event/subject
+    kind :event/kind jurisdiction :event/jurisdiction
+    effective-at :event/effective-at announcement-raw :event/announcement-raw
+    figures :event/figures missingness :event/missingness
+    receipts :event/receipts recorded-at :event/recorded-at
     :or {figures [] missingness #{}}
     :as ev}]
   (when-not (map? ev)
@@ -823,14 +832,13 @@
   (when (empty? receipts)
     (refuse :observation/no-receipts
             "event: at least one source receipt required"))
-  (doseq [r receipts]
-    (revalidate-receipt r)
-    (when-not (= jurisdiction (:receipt/jurisdiction r))
-      (refuse :event/cross-jurisdiction-receipt
-              (str "event: receipt " (:receipt/id r) " is from "
-                   (:receipt/jurisdiction r) ", event is about " jurisdiction))))
   (let [s (subject s0)
         rs (into #{} (map receipt) receipts)
+        _ (doseq [r rs]
+            (when-not (= jurisdiction (:receipt/jurisdiction r))
+              (refuse :event/cross-jurisdiction-receipt
+                      (str "event: receipt " (:receipt/id r) " is from "
+                           (:receipt/jurisdiction r) ", event is about " jurisdiction))))
         attributed (validate-figures figures rs)]
     (freeze (assoc ev
                    :event/method contract-version
@@ -881,7 +889,7 @@
     (when-not parent
       (refuse :event/refresh-of-unknown
               (str "refresh-event: prior event " prior-id " not in history")))
-    (when (contains? parent :obs/contract-version)
+    (when (obs-frozen? parent)
       (refuse :event/refresh-of-observation
               (str "refresh-event: " prior-id " is an OBSERVATION id —
                     events refresh events, observations refresh

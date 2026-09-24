@@ -181,7 +181,7 @@
     (is (= :observation/refresh-of-unknown
            (refusal-of #(obs/refresh h2 "obs:nope" (base-observation {})))))
     (is (= :observation/refresh-of-self
-           (refusal-of #(obs/refresh h2 prior (base-observation {}))))))))
+           (refusal-of #(obs/refresh h2 prior (base-observation {})))))))
 
 (deftest refresh-delta-is-verbatim-level
   (let [h1 (obs/observe [] (base-observation {}))

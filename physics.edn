@@ -1,0 +1,34 @@
+;; What this occupation's robot physically does, declared for
+;; kotoba.robotics.process (kotoba-lang/robotics). `kbb -M:physics` runs it.
+;;
+;; README "Robotics premise": a property-condition documentation robot
+;; performs walkthrough photographing, condition-report assembly and physical
+;; filing (ISCO 3334 real estate agents and property managers). Its physical
+;; work: a room-by-room walkthrough of the property, including hot attics
+;; where its own battery pack heats up.
+;;
+;; Every number without a cited source is marked `estimate` in its :basis.
+;; Replacing an estimate with a sourced value is this bot's growth work.
+{:physics/schema "itonami.physical-ai.spec.v1"
+ :repo "cloud-itonami/cloud-itonami-isco-3334"
+ :cases
+ [{:id :property-walkthrough
+   :kind :transport
+   :procedure "documentation robot drives the room-by-room walkthrough route of the property, stopping at each photo point"
+   :params {:mass-kg 30.0 :payload-kg 4.0 :v-max-mps 0.8 :a-max-mps2 0.4
+            :brake-decel-mps2 0.8 :drive-force-n 150.0 :crr 0.03
+            :cog-height-m 0.50 :support-half-length-m 0.25}
+   :sweep {:param :distance-m :values [50.0 100.0 200.0 300.0 400.0]}
+   :quantity :cycle-time-s
+   :limit {:max 300.0 :basis "estimate: driving time of one walkthrough fits the 5 minutes left in a showing slot after photo stops"}
+   :boundary {:lo 20.0 :hi 800.0}}
+  {:id :attic-battery-heating
+   :kind :thermal
+   :procedure "one hour documenting a hot attic: the robot's Li-ion pack (4 cm thick, taken as a 2 cm half-slab to its core) heated by natural convection from attic air"
+   :params {:thickness-m 0.02 :conductivity-w-mk 1.0 :density-kg-m3 2500.0 :specific-heat-j-kgk 1000.0
+            :t0-c 25.0 :h-front-w-m2k 8.0 :h-back-w-m2k 0.0 :t-back-ambient-c 25.0
+            :threshold-c 45.0 :duration-s 3600.0}
+   :sweep {:param :t-hot-c :values [45.0 55.0 65.0 75.0 85.0]}
+   :quantity :final-back-c
+   :limit {:max 45.0 :basis "estimate: 45 °C taken as a conservative core limit for the robot's Li-ion pack (cell datasheets commonly allow ~60 °C discharge, ~45 °C charge)"}
+   :boundary {:lo 40.0 :hi 100.0}}]}

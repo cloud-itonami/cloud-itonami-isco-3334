@@ -1,7 +1,7 @@
 (ns realestate.store
   "SSoT for the ISCO-08 3334 independent real estate & property
   management practice actor (itonami actor pattern, ADR-2607011000 /
-  CLAUDE.md Actors section; README's 'Robotics premise' — a
+  AGENTS.md Actors section; README's 'Robotics premise' — a
   property-condition documentation robot performs walkthrough
   photographing, condition-report assembly and physical filing under
   this advisor/governor pair, which never dispatches hardware itself
